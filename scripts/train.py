@@ -29,7 +29,7 @@ except:
 # -------------------------------
 
 warnings.filterwarnings("ignore")
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+#os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 def parse_arguments():
     parser = argparse.ArgumentParser()

@@ -71,20 +71,35 @@ class MedOpenSeg(SwinUNETR):
         return logits, embedding
 
     def load_from(self, weights):
-        """Loads weights, ignoring shape mismatches for the head."""
         with torch.no_grad():
-            model_state = self.state_dict()
-            pretrained_state = weights if "state_dict" not in weights else weights["state_dict"]
+            state_dict = weights if "state_dict" not in weights else weights["state_dict"]
+            model_dict = self.state_dict()
             
-            # Filter out keys that don't match (like the final head if classes differ)
-            pretrained_state = {
-                k: v for k, v in pretrained_state.items() 
-                if k in model_state and v.shape == model_state[k].shape
-            }
-            
-            self.load_state_dict(pretrained_state, strict=False)
-            print(f"[INFO] Loaded {len(pretrained_state)}/{len(model_state)} layers from pretrained weights.")
+            print(f"[DEBUG] Checkpoint keys (first 5): {list(state_dict.keys())[:5]}")
+            print(f"[DEBUG] Model keys (first 5):      {list(model_dict.keys())[:5]}")
 
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                k_new = k
+                
+                # FIX: Standardize MONAI SSL weights
+                # "encoder.patch_embed..." -> "swinViT.patch_embed..."
+                if k.startswith("encoder."):
+                    k_new = k.replace("encoder.", "swinViT.")
+                
+                # FIX: Handle DataParallel prefix
+                if k.startswith("module."):
+                    k_new = k.replace("module.", "")
+                    
+                if k_new in model_dict:
+                    if v.shape == model_dict[k_new].shape:
+                        new_state_dict[k_new] = v
+                    else:
+                        print(f"[WARNING] Shape mismatch for {k_new}: Ckpt {v.shape} vs Model {model_dict[k_new].shape}")
+
+            self.load_state_dict(new_state_dict, strict=False)
+            print(f"[INFO] Successfully loaded {len(new_state_dict)}/{len(model_dict)} layers.")
+            
 def get_medopenseg(
     device, 
     in_channels, 

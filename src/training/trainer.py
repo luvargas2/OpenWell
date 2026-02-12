@@ -80,19 +80,26 @@ class Trainer:
             
             with torch.cuda.amp.autocast():
                 logits, embedding = self.model(inputs)
-                
-                # Main Loss (Handles 255 internally)
                 loss_seg = self.loss_fn(logits, labels)
-                
-                # vMF Loss
+
                 loss_vmf = torch.tensor(0.0, device=self.device)
                 if self.memory_bank:
                     labels_sq = labels.squeeze(1)
-                    # Update (No grad, skips 255)
-                    self.memory_bank.update_prototypes(embedding.detach(), labels_sq)
-                    # Loss (Skips 255)
-                    loss_vmf = compute_vmf_loss(embedding, labels_sq, self.memory_bank, ignore_index=255)
-                
+                    
+                    # --- FIX 1: Cast to .float() (Float32) ---
+                    # The Memory Bank needs high precision for stability.
+                    embedding_f32 = embedding.detach().float() 
+                    
+                    self.memory_bank.update_prototypes(embedding_f32, labels_sq)
+                    
+                    # Compute loss using the float32 embedding
+                    loss_vmf = compute_vmf_loss(
+                        embedding.float(), # Pass float() here too
+                        labels_sq, 
+                        self.memory_bank, 
+                        ignore_index=255
+                    )
+
                 loss = loss_seg + 0.1 * loss_vmf
 
             self.scaler.scale(loss).backward()
@@ -168,7 +175,7 @@ class Trainer:
     def _log_visualization(self, inputs, labels, logits, embedding, epoch, step):
         with torch.no_grad():
             if self.memory_bank:
-                energy_map, _ = self.memory_bank.query_voxelwise_novelty(embedding)
+                energy_map, _ = self.memory_bank.query_voxelwise_novelty(embedding.float(), ignore_index=255)
             else:
                 energy_map = torch.zeros_like(labels).squeeze(1).float()
             
