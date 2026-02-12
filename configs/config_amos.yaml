@@ -1,25 +1,27 @@
 data:
   dataset: "AMOS"
   data_dir: "/home/vargas/amos22"
-  split_json: "dataset.json"
+  split_json: "dataset.json" # Ensure this file exists in data_dir
+
 model:
   in_channels: 1
+  # AMOS has 16 classes (0-15).
+  # We ignore [11, 12, 13, 14, 15] in transforms. right adrenal gland", "12": "left adrenal gland","13": "duodenum","14": "bladder","15": "prostate/uterus"
+  # So we learn Background (0) + 10 Organs = 11 Channels.
   out_channels: 11
   feature_size: 48
   embed_dim_final: 128
+
 training:
-  batch_size: 4
+  batch_size: 4 
   lr: 1e-4
-  max_iterations: 20000
-  eval_num: 20
-  checkpoint_dir:  "./outputs/amos/memory_energy_2"
+  max_iterations: 30000 # AMOS needs more iterations than BTCV
+  eval_num: 100 
+  checkpoint_dir: "./outputs/amos/memory_energy_2"
   pretrained_weights: "./weights/model_swinvit.pt"
+  
+  # Memory Bank Settings
   use_memory_bank: True  
-  feature_layer: "enc3"
-  similarity_threshold: 0.7 
   memory_size: 500
+  
   resume: False
-prototype_test:
-  batch_size: 2
-  checkpoint_dir:  #"./outputs/amos/energy_prototypes"
-  pretrained_weights:  #"./outputs/amos/energy_prototypes/checkpoint_epoch_10.pth"

@@ -39,7 +39,7 @@ class TrainingVisualizer:
         ignore_mask = (lbl == 255)
         if ignore_mask.any():
             ax[1].contour(np.rot90(ignore_mask[slice_idx]), colors='lime', linewidths=1)
-        ax[1].set_title("GT (Green=Ignore/Unseen)")
+        ax[1].set_title("GT (Green=Unseen)")
 
         # 3. Prediction
         ax[2].imshow(np.rot90(prd[slice_idx]), cmap="turbo")
@@ -52,6 +52,7 @@ class TrainingVisualizer:
         im = ax[3].imshow(np.rot90(nrg_norm[slice_idx]), cmap="magma")
         ax[3].set_title(f"Energy [{n_min:.1f}, {n_max:.1f}]")
         plt.colorbar(im, ax=ax[3])
-
-        plt.savefig(os.path.join(self.save_dir, f"epoch_{epoch:04d}_step_{step}.png"))
+        save_path = os.path.join(self.save_dir, f"epoch_{epoch:03d}_step_{step:04d}.png")
+        plt.savefig(save_path, dpi=300)
         plt.close()
+        return save_path

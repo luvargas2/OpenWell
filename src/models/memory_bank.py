@@ -12,19 +12,21 @@ class MemoryBankV(nn.Module):
     """
     Energy-Based Memory Bank for Open-World 3D Segmentation.
     
-    Models each class as a Von Mises-Fisher (vMF) distribution with:
-    1) Mean Direction (mu): The prototype vector.
-    2) Concentration (kappa): The inverse variance (how 'tight' the class is).
+    Theory:
+    Models each class as a Von Mises-Fisher (vMF) distribution on the hypersphere.
+    - Mean (mu): The semantic center of the class.
+    - Concentration (kappa): Inverse variance. High kappa = Tight cluster (Deep Energy Well).
     
-    Novelty is computed via Free Energy: pixels that don't fall into 
-    any class's 'energy well' have high energy -> Unknown.
+    Open-Set Logic:
+    - We clamp the Background (Class 0) kappa to be low (Shallow Well).
+    - We ignore 'Unseen' pixels (Label 255) during updates so they don't pollute prototypes.
     """
 
     def __init__(
         self,
         feature_dim: int,
         memory_size: int = 100,
-        epoch_counter = 0,
+        epoch_counter: int = 0,
         alpha: float = 0.9, # Momentum for EMA updates
         save_path: str = "./prototypes"
     ):
@@ -39,6 +41,7 @@ class MemoryBankV(nn.Module):
         # Storage: {class_id: {'mu': Tensor(F), 'kappa': Tensor(1), 'count': int}}
         self.prototypes = {}
         self.UNKNOWN_CLASS_ID = 999
+        self.IGNORE_LABEL = 255  # Consistent with transforms.py
 
     def save_memory_bank(self, save_path):
         if not self.prototypes:
@@ -56,9 +59,11 @@ class MemoryBankV(nn.Module):
 
     def load_memory_bank(self, memory_bank_path, device="cuda"):
         if not os.path.exists(memory_bank_path):
-            print(f"[ERROR] File not found: {memory_bank_path}")
+            print(f"[WARNING] Memory bank file not found: {memory_bank_path}. Starting fresh.")
             return
-        checkpoint = torch.load(memory_bank_path, map_location="cpu",weights_only=False)
+        
+        # weights_only=False allows loading complex dict structures
+        checkpoint = torch.load(memory_bank_path, map_location=device, weights_only=False)
         self.prototypes = {}
         for k, v in checkpoint.items():
             self.prototypes[k] = {
@@ -66,52 +71,62 @@ class MemoryBankV(nn.Module):
                 'kappa': v['kappa'].to(device),
                 'count': v['count']
             }
-        print(f"[INFO] Loaded {len(self.prototypes)} classes (with Energy parameters).")
+        print(f"[INFO] Loaded {len(self.prototypes)} classes into Memory Bank.")
 
+    @torch.no_grad()
     def update_prototypes(self, embeddings: torch.Tensor, labels: torch.Tensor):
         """
-        Updates Mean (mu) and Concentration (kappa).
-        CRITICAL FIX: We clamp Background (Class 0) to be 'loose' (Low Kappa).
+        Updates Mean (mu) and Concentration (kappa) using online statistics (EMA).
         """
+        # Embeddings: [B, F, D, H, W] -> Flatten to [B, N_voxels, F]
         B, F_dim, D, H, W = embeddings.shape
-        embeddings_flat = embeddings.view(B, F_dim, -1).permute(0, 2, 1) # [B, N, F]
-        labels_flat = labels.view(B, -1) # [B, N]
+        embeddings_flat = embeddings.view(B, F_dim, -1).permute(0, 2, 1) 
+        labels_flat = labels.view(B, -1)
 
         for b_idx in range(B):
             lbls = labels_flat[b_idx]
-            feats = embeddings_flat[b_idx] # [N, F]
+            feats = embeddings_flat[b_idx]
             
             unique_cls = lbls.unique()
             for cls_id in unique_cls:
                 cval = cls_id.item()
                 
-                # --- LOGIC FIX: Handle Ignore Label if present ---
-                if cval == self.UNKNOWN_CLASS_ID or cval == 255: 
+                # --- LOGIC FIX 1: Ignore Unseen/Void Pixels ---
+                # We strictly skip updates for the 'Unseen' mapped label (255)
+                # and the inference-time 'Unknown' label (999).
+                if cval == self.UNKNOWN_CLASS_ID or cval == self.IGNORE_LABEL: 
                     continue
 
                 mask = (lbls == cval)
                 class_feats = feats[mask]
                 
-                if class_feats.shape[0] < 5: continue 
+                # Minimum voxels needed for statistical stability
+                if class_feats.shape[0] < 5: 
+                    continue 
 
-                # 1. Normalize
+                # 1. Normalize features (project to hypersphere)
                 class_feats = F.normalize(class_feats, p=2, dim=1)
 
-                # 2. Mean Direction
+                # 2. Calculate Mean Direction
                 mean_vector = class_feats.mean(dim=0)
                 mean_dir = F.normalize(mean_vector, p=2, dim=0)
 
-                # 3. Estimate Kappa
+                # 3. Estimate Concentration (Kappa)
+                # R = length of mean vector. R close to 1 = Tight cluster.
                 R = mean_vector.norm(p=2).clamp(min=1e-6, max=0.999)
-                batch_kappa = (R * self.feature_dim) / (1 - R**2)
                 
-                # --- CRITICAL FIX: The "Soft Background" Logic ---
-                # Background (0) must have a wide well (low kappa) to avoid overfitting to unseen objects.
-                # Organs (1+) can have tight wells.
+                # vMF approximation for Kappa
+                batch_kappa = (R * self.feature_dim) / (1 - R**2 + 1e-6)
+                
+                # --- LOGIC FIX 2: Soft Background ---
+                # Background (0) is a "garbage" class with high variance. 
+                # We clamp its kappa to be low (max 10) to create a 'Shallow Well'.
+                # This allows Unseen objects (which don't match organs) to 
+                # register as High Energy rather than falling into the Background well.
                 if cval == 0:
-                    batch_kappa = torch.clamp(batch_kappa, max=10.0) # FORCE SHALLOW WELL
+                    batch_kappa = torch.clamp(batch_kappa, max=10.0) 
                 else:
-                    batch_kappa = torch.clamp(batch_kappa, max=100.0) # Allow deep wells for organs
+                    batch_kappa = torch.clamp(batch_kappa, max=100.0) 
 
                 # 4. Update Memory (EMA)
                 if cval not in self.prototypes:
@@ -124,91 +139,87 @@ class MemoryBankV(nn.Module):
                     old_mu = self.prototypes[cval]['mu']
                     old_kappa = self.prototypes[cval]['kappa']
                     
+                    # Update Mu
                     new_mu = self.alpha * old_mu + (1 - self.alpha) * mean_dir
                     new_mu = F.normalize(new_mu, p=2, dim=0)
+                    
+                    # Update Kappa
                     new_kappa = self.alpha * old_kappa + (1 - self.alpha) * batch_kappa
                     
                     self.prototypes[cval]['mu'] = new_mu
                     self.prototypes[cval]['kappa'] = new_kappa
                     self.prototypes[cval]['count'] += 1
 
-        if self.epoch_counter % 10 == 0:
+        # Periodic Visualization
+        if self.epoch_counter > 0 and self.epoch_counter % 10 == 0:
             self.save_tsne_plot()
 
-            
     def query_voxelwise_novelty(self, embedding_3d: torch.Tensor):
         """
-        Returns:
-            energy_map: [B, D, H, W] - Higher value means MORE NOVEL (Unknown).
-            class_pred: [B, D, H, W] - Predicted class ID (based on best energy well).
+        Computes Free Energy for every voxel based on stored prototypes.
         """
         if not self.prototypes:
-            # If empty, everything is unknown (high energy)
+            # Fallback if memory is empty
             return torch.ones_like(embedding_3d[:,0]), torch.zeros_like(embedding_3d[:,0])
 
         B, F_dim, D, H, W = embedding_3d.shape
         
-        # 1. Prepare Prototypes
-        # Stack mu: [C, F]
-        # Stack kappa: [C, 1]
+        # 1. Prepare Prototypes [C, F] and [C, 1]
         classes = sorted(self.prototypes.keys())
         mus = torch.stack([self.prototypes[c]['mu'] for c in classes]).to(embedding_3d.device)
         kappas = torch.stack([self.prototypes[c]['kappa'] for c in classes]).to(embedding_3d.device).unsqueeze(1)
         
-        # 2. Flatten Image Embeddings: [B, N, F]
+        # 2. Flatten Image: [B, N, F]
         emb_flat = embedding_3d.view(B, F_dim, -1).permute(0, 2, 1)
-        emb_flat = F.normalize(emb_flat, p=2, dim=2) # Normalize to sphere
+        emb_flat = F.normalize(emb_flat, p=2, dim=2) 
 
-        # 3. Compute vMF Logits (Similarity scaled by Concentration)
-        # Cosine Similarity: [B, N, F] @ [F, C] -> [B, N, C]
+        # 3. Compute Logits
+        # Similarity: [B, N, F] @ [F, C] -> [B, N, C]
         cosine_sim = torch.matmul(emb_flat, mus.t())
         
-        # Scale by Kappa (The "Energy Well" depth)
-        # Tighter classes (high kappa) punish deviation more
-        logits = cosine_sim * kappas.view(1, 1, -1) # [B, N, C]
+        # Scale by Concentration (Depth of Well)
+        # Broadcasting: [B, N, C] * [1, 1, C]
+        logits = cosine_sim * kappas.view(1, 1, -1)
         
-        # 4. Compute Free Energy
-        # E(z) = - LogSumExp(logits)
-        # We negate it so High Energy = Low Probability (Novel)
-        energy_flat = -torch.logsumexp(logits, dim=2) # [B, N]
+        # 4. Compute Free Energy E(z) = -LogSumExp(logits)
+        # High Energy = Low Probability = Anomaly
+        energy_flat = -torch.logsumexp(logits, dim=2) 
         
-        # 5. Get Predictions (Max Logit = Best Well)
+        # 5. Prediction (Deepest Well)
         val, idx = torch.max(logits, dim=2)
-        pred_flat = torch.tensor(classes, device=embedding_3d.device)[idx] # Map indices back to class IDs
+        pred_flat = torch.tensor(classes, device=embedding_3d.device)[idx]
         
-        # 6. Reshape
-        energy_map = energy_flat.view(B, D, H, W)
-        class_pred = pred_flat.view(B, D, H, W)
-
-        return energy_map, class_pred
+        return energy_flat.view(B, D, H, W), pred_flat.view(B, D, H, W)
 
     def save_tsne_plot(self, perplexity=30.0, random_state=42):
         if len(self.prototypes) < 2: return
 
-        # Extract Mus
+        # Extract data to CPU numpy
         class_ids = sorted(self.prototypes.keys())
         embeddings = torch.stack([self.prototypes[c]['mu'] for c in class_ids]).cpu().numpy()
-        
-        # Extract Kappas for point size (Tight classes = Larger points)
         kappas = torch.stack([self.prototypes[c]['kappa'] for c in class_ids]).cpu().numpy()
-        # Normalize kappas for display size
+        
+        # Visual size proportional to Concentration
         sizes = 100 + (kappas - kappas.min()) / (kappas.max() - kappas.min() + 1e-6) * 200
 
-        tsne = TSNE(n_components=2, perplexity=min(30, len(class_ids)-1), random_state=random_state)
-        embeddings_2d = tsne.fit_transform(embeddings)
+        try:
+            tsne = TSNE(n_components=2, perplexity=min(30, len(class_ids)-1), random_state=random_state)
+            embeddings_2d = tsne.fit_transform(embeddings)
 
-        sns.set_style("whitegrid")
-        plt.figure(figsize=(8, 6))
-        colors = sns.color_palette("husl", n_colors=len(class_ids))
+            sns.set_style("whitegrid")
+            plt.figure(figsize=(8, 6))
+            colors = sns.color_palette("husl", n_colors=len(class_ids))
 
-        texts = []
-        for i, (x, y) in enumerate(embeddings_2d):
-            plt.scatter(x, y, color=colors[i], s=sizes[i], edgecolors='k', alpha=0.8, label=str(class_ids[i]))
-            texts.append(plt.text(x, y, str(class_ids[i]), fontsize=10, fontweight='bold'))
+            texts = []
+            for i, (x, y) in enumerate(embeddings_2d):
+                plt.scatter(x, y, color=colors[i], s=sizes[i], edgecolors='k', alpha=0.8, label=str(class_ids[i]))
+                texts.append(plt.text(x, y, str(class_ids[i]), fontsize=10, fontweight='bold'))
 
-        adjust_text(texts)
-        plt.title("Prototype Energy Wells (Size ~ Concentration)", fontsize=14)
-        
-        plot_filename = os.path.join(self.save_path, f"prototypes_energy_{self.epoch_counter}.png")
-        plt.savefig(plot_filename, dpi=300)
-        plt.close()
+            adjust_text(texts)
+            plt.title("Prototype Energy Wells (Size ~ Concentration)", fontsize=14)
+            
+            plot_filename = os.path.join(self.save_path, f"prototypes_epoch_{self.epoch_counter}.png")
+            plt.savefig(plot_filename, dpi=300)
+            plt.close()
+        except Exception as e:
+            print(f"[WARNING] t-SNE plot failed: {e}")

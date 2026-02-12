@@ -1,6 +1,6 @@
 data:
   dataset: "BRATS"
-  data_dir: "datasets/BRATS/"
+  data_dir: "../medopenseg/datasets/BRATS/"
   split_json: "dataset.json"
 model:
   in_channels: 4

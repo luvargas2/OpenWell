@@ -1,6 +1,6 @@
 data:
   dataset: "MSD_PANCREAS"
-  data_dir: "datasets/MSD_PANCREAS/"
+  data_dir: "../medopenseg/datasets/MSD_PANCREAS/"
   split_json: "dataset.json"
 model:
   in_channels: 1
