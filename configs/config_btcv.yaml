@@ -1,0 +1,22 @@
+data:
+  dataset: "BTCV"
+  data_dir: "datasets/BTCV/"
+  split_json: "swin_unetr_btcv_dataset_0.json"
+model:
+  in_channels: 1
+  out_channels: 11                                                                                                                                                    
+  feature_size: 48  
+  embed_dim_final: 128
+training:
+  batch_size: 2
+  lr: 1e-4
+  max_iterations: 20000
+  eval_num: 10
+  checkpoint_dir: "./outputs/btcv/memory_energy_2"
+  pretrained_weights: "./weights/model_swinvit.pt"
+  use_memory_bank: True  
+  similarity_threshold: 0.7 
+  feature_layer: "enc3"
+  memory_size: 500
+  resume: False
+

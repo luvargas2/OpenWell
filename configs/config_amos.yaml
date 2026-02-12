@@ -1,0 +1,25 @@
+data:
+  dataset: "AMOS"
+  data_dir: "/home/vargas/amos22"
+  split_json: "dataset.json"
+model:
+  in_channels: 1
+  out_channels: 11
+  feature_size: 48
+  embed_dim_final: 128
+training:
+  batch_size: 4
+  lr: 1e-4
+  max_iterations: 20000
+  eval_num: 20
+  checkpoint_dir:  "./outputs/amos/memory_energy_2"
+  pretrained_weights: "./weights/model_swinvit.pt"
+  use_memory_bank: True  
+  feature_layer: "enc3"
+  similarity_threshold: 0.7 
+  memory_size: 500
+  resume: False
+prototype_test:
+  batch_size: 2
+  checkpoint_dir:  #"./outputs/amos/energy_prototypes"
+  pretrained_weights:  #"./outputs/amos/energy_prototypes/checkpoint_epoch_10.pth"
