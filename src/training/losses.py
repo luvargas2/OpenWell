@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from monai.losses import DiceLoss
 
 class OpenSetDiceCELoss(nn.Module):
@@ -15,8 +16,8 @@ class OpenSetDiceCELoss(nn.Module):
         # 1. CE: Natively supports ignore_index
         self.ce = nn.CrossEntropyLoss(ignore_index=ignore_index)
         
-        # 2. Dice: We exclude background calculation so the mapped pixels 
-        #    (mapped 255->0) don't contribute to the gradient.
+        # 2. Dice: We exclude background calculation so the pixels 
+        #    mapped to 0 don't contribute to the background class gradient.
         self.dice = DiceLoss(
             include_background=False, 
             to_onehot_y=True,
@@ -43,44 +44,75 @@ class OpenSetDiceCELoss(nn.Module):
 
 def compute_vmf_loss(embeddings, labels, memory_bank, temperature=0.1, ignore_index=255):
     """
-    Computes vMF Energy Loss.
-    Skips pixels labeled as ignore_index (Unseen).
+    Computes vMF Energy Loss (Vectorized & Optimized).
     """
     if len(memory_bank.prototypes) == 0:
         return torch.tensor(0.0, device=embeddings.device, requires_grad=True)
 
+    # 1. Prepare Prototypes
     classes = sorted(memory_bank.prototypes.keys())
     mus = torch.stack([memory_bank.prototypes[c]['mu'] for c in classes]).to(embeddings.device)
     kappas = torch.stack([memory_bank.prototypes[c]['kappa'] for c in classes]).to(embeddings.device).unsqueeze(1)
-    class_indices = {c: i for i, c in enumerate(classes)}
+    
+    # 2. Vectorized Lookup Table (Fixes speed & TypeError)
+    if not classes:
+        return torch.tensor(0.0, device=embeddings.device, requires_grad=True)
+        
+    # FIX: Explicitly cast to int for torch.full size
+    max_cls = int(max(classes))
+    
+    # Create a lookup tensor initialized to -1
+    lookup = torch.full((max_cls + 1,), -1, device=embeddings.device, dtype=torch.long)
+    
+    # Populate lookup: Class ID -> Prototype Index
+    for idx, c in enumerate(classes):
+        lookup[int(c)] = idx
 
     B, F_dim = embeddings.shape[:2]
     # Flatten: [B, F, N] -> [B, N, F]
     emb_flat = embeddings.reshape(B, F_dim, -1).permute(0, 2, 1)
     lbl_flat = labels.reshape(B, -1)
     
-    emb_flat = torch.nn.functional.normalize(emb_flat, p=2, dim=2)
+    # Normalize image embeddings once
+    emb_flat = F.normalize(emb_flat, p=2, dim=2)
 
     loss = 0.0
     valid_batches = 0
 
     for b in range(B):
-        # Filter: Must be a known class AND not the ignore index
-        # This prevents the model from pulling 'Unseen' pixels towards ANY prototype.
-        valid_mask = torch.isin(lbl_flat[b], torch.tensor(classes, device=embeddings.device)) & (lbl_flat[b] != ignore_index)
+        batch_lbls = lbl_flat[b]
         
-        if not valid_mask.any(): continue
+        # Fast Masking
+        # A. Ignore 'ignore_index' (255)
+        # B. Ignore labels larger than our lookup table (safety check)
+        valid_mask = (batch_lbls != ignore_index) & (batch_lbls <= max_cls)
+        
+        if not valid_mask.any(): 
+            continue
 
-        valid_emb = emb_flat[b][valid_mask]
-        valid_lbl = lbl_flat[b][valid_mask]
+        # Get valid pixels
+        valid_lbls = batch_lbls[valid_mask]
+        
+        # Map Labels to Prototype Indices using GPU Lookup
+        # FIX: Ensure valid_lbls is LongTensor for indexing
+        target_indices = lookup[valid_lbls.long()]
+        
+        # Filter out classes that are not yet in the memory bank (mapped to -1)
+        final_mask = target_indices != -1
+        
+        if not final_mask.any():
+            continue
+            
+        final_targets = target_indices[final_mask]
+        # Select corresponding embeddings
+        final_embs = emb_flat[b][valid_mask][final_mask]
 
-        target_indices = torch.tensor([class_indices[l.item()] for l in valid_lbl], device=embeddings.device)
-
-        # Logits = Similarity * Concentration
-        cos_sim = torch.matmul(valid_emb, mus.t())
+        # 3. Compute Logits & Loss
+        # Cosine Sim: [N_valid, F] @ [F, N_classes] -> [N_valid, N_classes]
+        cos_sim = torch.matmul(final_embs, mus.t())
         logits = cos_sim * kappas.view(1, -1)
         
-        loss += torch.nn.functional.cross_entropy(logits / temperature, target_indices)
+        loss += F.cross_entropy(logits / temperature, final_targets)
         valid_batches += 1
 
     if valid_batches > 0:

@@ -38,7 +38,7 @@ class Trainer:
         self.checkpoint_dir = config["training"]["checkpoint_dir"]
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
-        # 2. Initialize Logger (Now safe)
+        # 2. Initialize Logger
         self.logger = ExperimentLogger(
             log_dir=self.checkpoint_dir, 
             config=config,
@@ -52,8 +52,6 @@ class Trainer:
         self.scaler = torch.cuda.amp.GradScaler()
         
         # Metrics & Post-processing
-        # include_background=False ignores class 0.
-        # We will map '255' -> '0' in validation so it gets ignored too.
         self.dice_metric = DiceMetric(include_background=False, reduction="mean", get_not_nans=False)
         self.post_label = AsDiscrete(to_onehot=config["model"]["out_channels"])
         self.post_pred = AsDiscrete(argmax=True, to_onehot=config["model"]["out_channels"])
@@ -66,8 +64,6 @@ class Trainer:
     def train_epoch(self, epoch):
         self.model.train()
         epoch_loss = 0
-        epoch_seg_loss = 0
-        epoch_vmf_loss = 0
         
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}", dynamic_ncols=True)
         
@@ -86,15 +82,12 @@ class Trainer:
                 if self.memory_bank:
                     labels_sq = labels.squeeze(1)
                     
-                    # --- FIX 1: Cast to .float() (Float32) ---
-                    # The Memory Bank needs high precision for stability.
+                    # Float32 required for Memory Bank
                     embedding_f32 = embedding.detach().float() 
-                    
                     self.memory_bank.update_prototypes(embedding_f32, labels_sq)
                     
-                    # Compute loss using the float32 embedding
                     loss_vmf = compute_vmf_loss(
-                        embedding.float(), # Pass float() here too
+                        embedding.float(), 
                         labels_sq, 
                         self.memory_bank, 
                         ignore_index=255
@@ -109,14 +102,17 @@ class Trainer:
             if self.scheduler:
                 self.scheduler.step()
 
-            # Logs
-            current_lr = self.optimizer.param_groups[0]['lr']
             epoch_loss += loss.item()
-            epoch_seg_loss += loss_seg.item()
-            epoch_vmf_loss += loss_vmf.item()
             
-            self.logger.log_scalar("Train/Step_Loss", loss.item(), self.global_step)
-            self.logger.log_scalar("Train/Step_LR", current_lr, self.global_step)
+            # --- LOGGING FIX ---
+            # Batch logs into one dictionary to prevent "monotonic step" errors
+            metrics = {
+                "Train/Step_Loss": loss.item(),
+                "Train/Step_Seg": loss_seg.item(),
+                "Train/Step_vMF": loss_vmf.item(),
+                "Train/Step_LR": self.optimizer.param_groups[0]['lr']
+            }
+            self.logger.log_metrics(metrics, step=self.global_step)
 
             pbar.set_postfix({
                 "Seg": f"{loss_seg.item():.4f}", 
@@ -124,7 +120,7 @@ class Trainer:
             })
 
             # Snapshot every 100 steps
-            if self.global_step % 5 == 0:
+            if self.global_step % 100 == 0:
                 self._log_visualization(inputs, labels, logits, embedding, epoch, step)
 
         return epoch_loss / len(self.train_loader)
@@ -150,7 +146,6 @@ class Trainer:
                 val_labels_list = decollate_batch(val_labels)
                 val_outputs_list = decollate_batch(val_outputs)
                 
-                # Map 255 -> 0 before OneHot to avoid crash
                 val_labels_convert = [
                     self.post_label(self._safe_map_ignore(label)) for label in val_labels_list
                 ]
@@ -164,11 +159,15 @@ class Trainer:
             self.dice_metric.reset()
             
         print(f"Epoch {epoch} | Validation Dice: {mean_dice:.4f}")
-        self.logger.log_scalar("Val/Dice", mean_dice, epoch)
+        
+        # --- LOGGING FIX ---
+        # Use self.global_step instead of epoch to keep X-axis aligned
+        self.logger.log_scalar("Val/Dice", mean_dice, self.global_step)
+        
         return mean_dice
 
     def _safe_map_ignore(self, label_tensor):
-        """Maps 255 (Ignore) to 0 (Background) for Validation metrics."""
+        """Maps 255 to 0 for validation Dice calculation only."""
         label_tensor[label_tensor == 255] = 0
         return label_tensor
 
@@ -181,12 +180,10 @@ class Trainer:
             
             preds = torch.argmax(logits, dim=1)
             
-            # Save Locally
             save_path = self.vis.log_snapshot(inputs, labels, preds, energy_map, epoch, step)
             
-            # Log to WandB
             if save_path:
-                self.logger.log_image("Debug/Snapshot", save_path, step)
+                self.logger.log_image("Debug/Snapshot", save_path, self.global_step)
 
     def save_checkpoint(self, epoch, metric, is_best=False):
         state = {
@@ -211,10 +208,34 @@ class Trainer:
             torch.save(state, best_path)
             print(f"[INFO] New Best Model Saved! (Dice: {metric:.4f})")
 
+    def load_checkpoint(self, path):
+        if not os.path.exists(path):
+            print(f"[WARNING] Checkpoint not found at {path}. Starting from scratch.")
+            return
+
+        print(f"[INFO] Loading checkpoint: {path}")
+        checkpoint = torch.load(path, map_location=self.device)
+        
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        
+        self.start_epoch = checkpoint["epoch"] + 1
+        self.best_dice = checkpoint.get("best_dice", 0.0)
+        self.global_step = checkpoint.get("global_step", 0)
+        
+        if self.memory_bank:
+            mb_path = os.path.join(os.path.dirname(path), "energy_memory_bank.pth")
+            self.memory_bank.load_memory_bank(mb_path, self.device)
+
     def fit(self):
         max_epochs = self.config["training"]["max_iterations"] // len(self.train_loader)
         eval_freq = self.config["training"]["eval_num"]
         
+        # Resume if needed
+        if self.config["training"].get("resume", False):
+            self.load_checkpoint(os.path.join(self.checkpoint_dir, "best_checkpoint.pth"))
+
         print(f"[INFO] Starting training: Epoch {self.start_epoch} to {max_epochs}")
 
         for epoch in range(self.start_epoch, max_epochs + 1):
