@@ -175,7 +175,7 @@ class Trainer:
     def _log_visualization(self, inputs, labels, logits, embedding, epoch, step):
         with torch.no_grad():
             if self.memory_bank:
-                energy_map, _ = self.memory_bank.query_voxelwise_novelty(embedding.float(), ignore_index=255)
+                energy_map, _ = self.memory_bank.query_voxelwise_novelty(embedding.float())
             else:
                 energy_map = torch.zeros_like(labels).squeeze(1).float()
             
