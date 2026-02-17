@@ -11,6 +11,8 @@ class TrainingVisualizer:
     def log_snapshot(self, inputs, labels, preds, energy, epoch, step):
         """
         Saves a visual snapshot of the current training state.
+        Automatically selects the slice with the most 'Unseen' (255) content.
+        
         inputs: [B, C, D, H, W]
         labels: [B, 1, D, H, W]
         preds: [B, D, H, W]
@@ -29,16 +31,33 @@ class TrainingVisualizer:
         # energy is [B, D, H, W] -> nrg is [D, H, W]
         nrg = energy[0, :, :, :].detach().cpu().numpy()
 
-        # 2. Select Middle Slice (The Fix)
-        # shape is (96, 96, 96), so slice_idx = 48
-        slice_idx = img.shape[0] // 2 
+        # 2. Smart Slice Selection
+        # Strategy A: Find slice with most 'Ignored' (255) pixels
+        ignore_counts = np.sum(lbl == 255, axis=(1, 2))
+        max_ignore = np.max(ignore_counts)
         
+        if max_ignore > 0:
+            slice_idx = np.argmax(ignore_counts)
+            tag = "Focus: Unseen"
+        else:
+            # Strategy B: If no Unseen, find slice with most Organ pixels (>0)
+            organ_counts = np.sum(lbl > 0, axis=(1, 2))
+            max_organ = np.max(organ_counts)
+            if max_organ > 0:
+                slice_idx = np.argmax(organ_counts)
+                tag = "Focus: Organ"
+            else:
+                # Strategy C: Fallback to Middle
+                slice_idx = img.shape[0] // 2
+                tag = "Focus: Mid"
+
+        # 3. Extract the chosen 2D slice
         img_slice = img[slice_idx, :, :]
         lbl_slice = lbl[slice_idx, :, :]
         prd_slice = prd[slice_idx, :, :]
         nrg_slice = nrg[slice_idx, :, :]
 
-        # 3. Plotting
+        # 4. Plotting
         fig, ax = plt.subplots(1, 4, figsize=(20, 5))
         
         # A. Input Image
@@ -55,8 +74,6 @@ class TrainingVisualizer:
         # Contour for Ignore Index (255)
         ignore_mask = (lbl_slice == 255)
         if ignore_mask.any():
-            # We must use [::-1] or rot90 logic for contours to match imshow
-            # Simplest is to just imshow the mask with specific color
             ax[1].contour(np.rot90(ignore_mask), colors='lime', linewidths=1.5)
         ax[1].set_title("GT (Green=Ignored)")
         ax[1].axis('off')
@@ -79,7 +96,7 @@ class TrainingVisualizer:
         ax[3].axis('off')
         plt.colorbar(im, ax=ax[3], fraction=0.046, pad=0.04)
 
-        # 4. Save and Return Path
+        # 5. Save and Return Path
         save_path = os.path.join(self.save_dir, f"epoch_{epoch:03d}_step_{step:04d}.png")
         plt.tight_layout()
         plt.savefig(save_path)

@@ -123,10 +123,13 @@ class MemoryBankV(nn.Module):
                 # We clamp its kappa to be low (max 10) to create a 'Shallow Well'.
                 # This allows Unseen objects (which don't match organs) to 
                 # register as High Energy rather than falling into the Background well.
+
                 if cval == 0:
-                    batch_kappa = torch.clamp(batch_kappa, max=10.0) 
+                    # Deepen the Background well so it captures the "true" background makes the background "well" deeper and narrower.
+                    # effectively leaving the "Unseen" pixels stranded in high-energy space.
+                    batch_kappa = torch.clamp(batch_kappa, max=50.0) # WAS 10.0
                 else:
-                    batch_kappa = torch.clamp(batch_kappa, max=100.0) 
+                    batch_kappa = torch.clamp(batch_kappa, max=100.0)
 
                 # 4. Update Memory (EMA)
                 if cval not in self.prototypes:

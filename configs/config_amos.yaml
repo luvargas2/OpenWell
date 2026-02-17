@@ -13,11 +13,11 @@ model:
   embed_dim_final: 128
 
 training:
-  batch_size: 4 
+  batch_size: 1 
   lr: 1e-4
-  max_iterations: 30000 # AMOS needs more iterations than BTCV
+  max_iterations: 50000 # AMOS needs more iterations than BTCV
   eval_num: 100 
-  checkpoint_dir: "./outputs/amos/memory_energy_2"
+  checkpoint_dir: "./outputs/amos/memory_energy2"
   pretrained_weights: "./weights/model_swinvit.pt"
   
   # Memory Bank Settings

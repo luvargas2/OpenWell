@@ -12,9 +12,9 @@ model:
 training:
   batch_size: 2
   lr: 1e-4
-  max_iterations: 20000
-  eval_num: 500 # Validate every 500 steps (10 is too frequent for 3D)
-  checkpoint_dir: "./outputs/btcv/memory_energy"
+  max_iterations: 30000
+  eval_num: 100 # Validate every 500 steps (10 is too frequent for 3D)
+  checkpoint_dir: "./outputs/btcv/memory_energy3"
   pretrained_weights: "./weights/model_swinvit.pt"
   
   # Memory Bank Settings
