@@ -3,6 +3,7 @@ import os
 import argparse
 import numpy as np
 import yaml
+import sys
 import scipy.ndimage as ndimage
 
 import matplotlib.pyplot as plt
@@ -10,17 +11,18 @@ import nibabel as nib
 from monai.inferers import sliding_window_inference
 from monai.data import load_decathlon_datalist, Dataset, ThreadDataLoader
 from monai.data.meta_tensor import MetaTensor
-from skimage.morphology import binary_erosion, disk
-from skimage import measure
 
 # --- FIX FOR PYTORCH 2.6+ WEIGHTS_ONLY ERROR ---
 torch.serialization.add_safe_globals([MetaTensor])
 
+# Add project root to python path so 'src' is importable
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+
 # --- YOUR IMPORTS ---
-from models.memory_bank_voxelwise import MemoryBankV
-from models.swin_unetr import get_medopenseg
-from preprocess.brats import create_body_mask
-from transforms.data_transforms import get_btcv_transforms, get_brats_transforms, get_amos_transforms, get_msdpancreas_transforms
+from src.models.memory_bank import MemoryBankV
+from src.models.swin_unetr import get_medopenseg
+from src.data.transforms import get_btcv_transforms, get_brats_transforms, get_amos_transforms, get_msdpancreas_transforms
 
 def load_transforms(config, device):
     dataset = config["data"]["dataset"]
@@ -30,155 +32,113 @@ def load_transforms(config, device):
     elif dataset == "MSD_PANCREAS": return get_msdpancreas_transforms(device)
     else: raise ValueError(f"Unknown dataset: {dataset}")
 
-def find_slice_with_most_unseen(label, unseen_start_idx=10):
-    # Sum over first two dimensions (D, H) to find best W slice
-    unseen_pixels = np.sum(label > unseen_start_idx, axis=(0, 1))
+def find_slice_with_most_unseen(label, unseen_classes=[11, 12, 13]):
+    mask = np.isin(label, unseen_classes)
+    unseen_pixels = np.sum(mask, axis=(0, 1))
     if unseen_pixels.max() == 0:
         return label.shape[2] // 2 
     return np.argmax(unseen_pixels)
 
-def visualize_results(inputs, labels, pred_seg, energy_map, slice_idx, output_path, gamma_threshold=20.0):
-    """
-    Visualizes: GT, Closed-Set Pred, Energy Map (Novelty), and Final Open-Set Pred.
-    Expects 3D inputs (D, H, W) - No singleton channels!
-    """
+# ==========================================
+# INTERACTIVE ENROLLMENT FUNCTIONS
+# ==========================================
+def simulate_user_click(label_np, unseen_classes=[11, 12, 13]):
+    """Simulates a user clicking on the center of a novel anomaly."""
+    mask = np.isin(label_np, unseen_classes)
+    if not np.any(mask):
+        return None
+    coords = ndimage.center_of_mass(mask)
+    return tuple(int(c) for c in coords)
+
+def create_guidance_map(shape, click_coord, sigma=6.0):
+    """Generates a 3D Gaussian heatmap centered at the user click (Eq. 9)."""
+    z, y, x = np.indices(shape)
+    cz, cy, cx = click_coord
+    dist_sq = (z - cz)**2 + (y - cy)**2 + (x - cx)**2
+    heatmap = np.exp(-dist_sq / (2 * sigma**2))
+    return torch.tensor(heatmap, dtype=torch.float32)
+
+def enroll_new_class(embedding, guidance_map, device, default_kappa=50.0):
+    """Calculates mu_new and kappa_new based on the guided local features."""
+    g = guidance_map.to(device).unsqueeze(0).unsqueeze(0)
+    
+    # Aggregate features weighted by the guidance map
+    weighted_features = embedding * g
+    sum_features = weighted_features.sum(dim=(2, 3, 4)) # [1, C]
+    sum_g = g.sum() + 1e-8
+    
+    # Calculate Mean Direction (mu_c)
+    mu_new = sum_features / sum_g
+    mu_new = mu_new / (torch.norm(mu_new, p=2, dim=1, keepdim=True) + 1e-8)
+    
+    # Assign Concentration (kappa_c)
+    kappa_new = torch.tensor([default_kappa], device=device)
+    
+    return mu_new, kappa_new
+
+# ==========================================
+# VISUALIZATION
+# ==========================================
+def visualize_interactive_enrollment(inputs, labels, pred_seg, open_pred, guidance_map, click_coord, slice_idx, output_path):
     fig, axes = plt.subplots(1, 4, figsize=(24, 6))
     
-    # Slicing: inputs is (D, H, W) -> inputs[:, :, slice] is (D, H)
     vol_slice = np.rot90(inputs[:, :, slice_idx])
     lbl_slice = np.rot90(labels[:, :, slice_idx])
     pred_slice = np.rot90(pred_seg[:, :, slice_idx])
-    energy_slice = np.rot90(energy_map[:, :, slice_idx])
-    
-    # 1. Ground Truth
-    masked_lbl = np.ma.masked_where(lbl_slice == 0, lbl_slice)
-    axes[0].imshow(vol_slice, cmap="gray")
-    axes[0].imshow(masked_lbl, cmap="turbo", alpha=0.6)
-    axes[0].set_title("Ground Truth")
-    axes[0].axis("off")
-    
-    # 2. Closed-Set Prediction
-    axes[1].imshow(pred_slice, cmap="turbo")
-    axes[1].set_title("Closed-Set Prediction")
-    axes[1].axis("off")
-    
-    # 3. Energy Map (Novelty)
-    axes[2].imshow(vol_slice, cmap="gray")
-    im = axes[2].imshow(energy_slice, cmap="magma", alpha=0.8)
-    axes[2].set_title("Free Energy Map (Novelty)")
-    axes[2].axis("off")
-    plt.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04, label="Energy E(z)")
-
-    # 4. Open-Set Segmentation
-    open_set_pred = pred_slice.copy()
-    novelty_mask = energy_slice > gamma_threshold
-    open_set_pred[novelty_mask] = 99 
-    
-    axes[3].imshow(open_set_pred, cmap="turbo")
-    axes[3].contour(novelty_mask, colors='red', linewidths=0.5)
-    axes[3].set_title(f"Open-Set Result (Gamma={gamma_threshold})")
-    axes[3].axis("off")
-
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    plt.close()
-
-
-
-def visualize_results_meet(inputs, labels, pred_seg, energy_map, slice_idx, output_path, gamma_threshold=None, simulate_ideal=True):
-    fig, axes = plt.subplots(1, 4, figsize=(24, 6))
-    
-    # 1. Rotate & Slice
-    vol_slice = np.rot90(inputs[:, :, slice_idx])
-    lbl_slice = np.rot90(labels[:, :, slice_idx])
-    pred_slice = np.rot90(pred_seg[:, :, slice_idx])
-    energy_slice = np.rot90(energy_map[:, :, slice_idx])
-    
-    # 2. Extract "Unseen" Ground Truth Mask
+    open_slice = np.rot90(open_pred[:, :, slice_idx])
     unseen_gt_mask = np.isin(lbl_slice, [11, 12, 13])
-
-    # 3. "LESS PERFECT" SIMULATION LOGIC
-    if simulate_ideal:
-        # Normalize real energy to [0, 1]
-        e_min, e_max = energy_slice.min(), energy_slice.max()
-        real_energy = (energy_slice - e_min) / (e_max - e_min + 1e-8)
-        
-        # Create a "leaky" signal: High sigma makes the detection blurry/bloated
-        leaky_signal = ndimage.gaussian_filter(unseen_gt_mask.astype(float), sigma=3.0)
-        
-        # Add random artifacts (false positives in the background)
-        random_noise = np.random.rand(*energy_slice.shape) * 0.2
-        random_noise = ndimage.gaussian_filter(random_noise, sigma=1.0)
-        
-        # Blend: Only 40% target signal, 30% background noise, 30% real model output
-        energy_norm = (0.6 * leaky_signal) + (0.1 * random_noise) + (0.3 * real_energy)
-        energy_norm = np.clip(energy_norm, 0, 1) # Ensure valid range
-    else:
-        e_min, e_max = energy_slice.min(), energy_slice.max()
-        energy_norm = (energy_slice - e_min) / (e_max - e_min + 1e-8)
     
-    # 4. Thresholding (Using a stricter percentile to show "patchy" detection)
-    if gamma_threshold is None:
-        gamma_threshold = np.percentile(energy_norm, 96) 
-    
-    novelty_mask = energy_norm > gamma_threshold
-
-    # --- PLOTTING ---
-    
-    # Plot 1: Ground Truth
+    # 1. Ground Truth + Simulated Click
     axes[0].imshow(vol_slice, cmap="gray")
     masked_lbl = np.ma.masked_where(lbl_slice == 0, lbl_slice)
     axes[0].imshow(masked_lbl, cmap="turbo", alpha=0.6)
     axes[0].contour(unseen_gt_mask, colors='lime', linewidths=1.2, linestyles='dashed')
-    axes[0].set_title("Ground Truth\n(Green Dashed = Unseen)")
+    
+    if click_coord and click_coord[2] == slice_idx:
+        axes[0].plot(click_coord[0], click_coord[1], marker='+', color='white', markersize=15, markeredgewidth=2)
+    
+    axes[0].set_title("Ground Truth\n(+ Simulated Click)")
     axes[0].axis("off")
     
-    # Plot 2: Closed-Set Prediction
+    # 2. Closed-Set Prediction (Memory Bank Query 1)
     axes[1].imshow(pred_slice, cmap="turbo")
-    axes[1].set_title("Closed-Set Prediction")
+    axes[1].set_title("Closed-Set Prediction\n(Fails on Unseen)")
     axes[1].axis("off")
     
-    # Plot 3: Energy Map (Now patchy and noisy)
-    axes[2].imshow(vol_slice, cmap="gray")
-    im = axes[2].imshow(energy_norm, cmap="magma", alpha=0.8)
-    axes[2].set_title("Novelty Energy Map\n(Noisy Detection)")
+    # 3. Guidance Map
+    if guidance_map is not None:
+        guidance_slice = np.rot90(guidance_map[:, :, slice_idx].cpu().numpy())
+        axes[2].imshow(vol_slice, cmap="gray")
+        axes[2].imshow(guidance_slice, cmap="cool", alpha=0.6)
+    axes[2].set_title("User Guidance Map $\mathcal{G}$\n(Local Feature Extraction)")
     axes[2].axis("off")
-    plt.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04)
 
-    # Plot 4: Anomaly Detection
-    open_set_pred = pred_slice.copy()
-    open_set_pred[novelty_mask] = 99 
-    
-    axes[3].imshow(open_set_pred, cmap="turbo")
-    axes[3].contour(novelty_mask, colors='red', linewidths=0.8) 
-    axes[3].contour(unseen_gt_mask, colors='lime', linewidths=1.2, linestyles='dashed')
-    axes[3].set_title("Red=Detected (Noisy), Green=GT")
+    # 4. Open-World Enrolled Result (Memory Bank Query 2)
+    axes[3].imshow(open_slice, cmap="turbo")
+    axes[3].contour(open_slice == 99, colors='red', linewidths=1.5) 
+    axes[3].set_title("Instant Open-World Result\n(New Well Dug: Red Outline)")
     axes[3].axis("off")
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
 
+# ==========================================
+# MAIN INFERENCE LOOP
+# ==========================================
 def load_model(checkpoint_path, device, config):
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    
     model = get_medopenseg(
-        device=device,
-        in_channels=config["model"]["in_channels"],
-        out_channels=config["model"]["out_channels"],
-        img_size=(96,96,96),
-        feature_size=config["model"]["feature_size"],
-        embed_dim_final=config["model"]["embed_dim_final"],
+        device=device, in_channels=config["model"]["in_channels"],
+        out_channels=config["model"]["out_channels"], img_size=(96,96,96),
+        feature_size=config["model"]["feature_size"], embed_dim_final=config["model"]["embed_dim_final"],
         pre_trained_weights=None
     )
-    
     state_dict = checkpoint["model_state_dict"]
     new_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
     model.load_state_dict(new_state_dict)
-    
     model.to(device)
     model.eval()
-    print("[INFO] Loaded trained model for inference.")
     return model
 
 def infer_and_segment(model, memory_bank, test_loader, device, output_dir):
@@ -191,63 +151,75 @@ def infer_and_segment(model, memory_bank, test_loader, device, output_dir):
             inputs = batch["image"].to(device)
             labels = batch["label"].to(device)
             
-            # Robust filename extraction
             filename = f"sample_{i}"
             if "image_meta_dict" in batch:
-                img_path = batch["image_meta_dict"]["filename_or_obj"][0]
-                filename = os.path.basename(img_path).split('.')[0]
-            elif hasattr(batch["image"], "meta"):
-                meta_dict = batch["image"].meta
-                if "filename_or_obj" in meta_dict:
-                    img_path = meta_dict["filename_or_obj"][0]
-                    filename = os.path.basename(img_path).split('.')[0]
+                filename = os.path.basename(batch["image_meta_dict"]["filename_or_obj"][0]).split('.')[0]
 
-            print(f"[PROC] Processing {filename}...")
+            print(f"\n[PROC] Processing {filename}...")
             
-            # 1. Inference
+            # --- PHASE 1: Feature Extraction ---
             with torch.amp.autocast(device.type):
-                outputs, embedding = sliding_window_inference(
+                _, embedding = sliding_window_inference(
                     inputs, roi_size=(96, 96, 96), sw_batch_size=4, overlap=0.5,
                     mode="gaussian", predictor=model
                 )
             
-            # 2. Prediction & Memory Bank
-            pred_seg = torch.argmax(outputs, dim=1)
-            energy_map, _ = memory_bank.query_voxelwise_novelty(embedding)
-
-
-            print(f"[DEBUG] Energy Stats: Min={energy_map.min():.4f}, Max={energy_map.max():.4f}, Mean={energy_map.mean():.4f}")
-            print(f"[DEBUG] Pred Stats: Unique Classes Predicted = {torch.unique(pred_seg)}")
-
-            # If Pred is only [0], your model is outputting only background.
-            # Check input intensity:
-            print(f"[DEBUG] Input Image Stats: Min={inputs.min():.4f}, Max={inputs.max():.4f}")
+            # CRITICAL THEORETICAL FIX: 
+            # We discard the neural network's linear head entirely. 
+            # The Memory Bank IS the open-set classifier!
+            _, pred_seg = memory_bank.query_voxelwise_novelty(embedding, include_background=True)
             
-            # 3. Prepare Numpy (Keep as 3D: D, H, W)
+            # --- PHASE 2: Instant Interactive Enrollment ---
             vol_np = inputs[0, 0].cpu().numpy()
             lbl_np = labels[0, 0].cpu().numpy()
             pred_np = pred_seg[0].cpu().numpy()
-            energy_np = energy_map[0].cpu().numpy()
             
-            # 4. Visualization
+            open_world_pred = pred_seg.clone()
+            guidance_map = None
+            
+            # Check if class 99 is already in the memory bank from a previous patient!
+            already_enrolled = (99 in memory_bank.prototypes)
+
+            click_coord = simulate_user_click(lbl_np)
+            
+            if click_coord and not already_enrolled:
+                print(f"[INFO] Novel anomaly detected! Simulating user click at {click_coord}")
+                
+                # 1. Generate Gaussian guidance
+                guidance_map = create_guidance_map(lbl_np.shape, click_coord, sigma=6.0).to(device)
+                
+                # 2. Extract local features
+                mu_new, kappa_new = enroll_new_class(embedding, guidance_map, device)
+                
+                # 3. Dig the new well permanently in the Memory Bank!
+                memory_bank.enroll_interactive_prototype(
+                    new_class_id=99, 
+                    mu_new=mu_new.squeeze(0), # Remove batch dim [F]
+                    kappa_new=kappa_new.squeeze(0) # [1]
+                )
+                
+                # 4. MAGIC STEP: Just query the memory bank again!
+                # Because the new well exists, the math automatically updates the segmentation.
+                _, open_world_pred = memory_bank.query_voxelwise_novelty(embedding, include_background=True)
+                
+            elif already_enrolled:
+                print("[INFO] Class 99 was enrolled on a previous patient. It will segment automatically!")
+            else:
+                print("[INFO] No anomaly found in this volume.")
+
+            # --- VISUALIZATION ---
             slice_idx = find_slice_with_most_unseen(lbl_np)
-            vis_path = os.path.join(output_dir, f"{filename}_energy.png")
+            vis_path = os.path.join(output_dir, f"{filename}_interactive.png")
             
-            # FIX: Do NOT use np.newaxis here. Pass 3D arrays directly.
-            visualize_results_meet(
-                inputs=vol_np,        # Passed as (D, H, W)
-                labels=lbl_np,        # Passed as (D, H, W)
-                pred_seg=pred_np,     # Passed as (D, H, W)
-                energy_map=energy_np, # Passed as (D, H, W)
-                slice_idx=slice_idx,
-                output_path=vis_path,
-                gamma_threshold=20.0
+            visualize_interactive_enrollment(
+                inputs=vol_np, labels=lbl_np, pred_seg=pred_np,
+                open_pred=open_world_pred[0].cpu().numpy(),
+                guidance_map=guidance_map, click_coord=click_coord,
+                slice_idx=slice_idx, output_path=vis_path
             )
             
-            # 5. Append Result
-            results.append(pred_np)
+            results.append(open_world_pred[0].cpu().numpy())
 
-    print(f"[INFO] Inference Done. Processed {len(results)} volumes.")
     return results 
 
 def main():
@@ -257,53 +229,37 @@ def main():
     args = parser.parse_args()
     
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print(f"[INFO] Using device: {device}")
 
     config_path = os.path.join("./configs", f"{args.config}.yaml")
     with open(config_path, "r") as file:
         config = yaml.safe_load(file)
         
-    exps_root = '/home/vargas/medopenseg/outputs'
+    exps_root = '/home/vargas/openwell/outputs'
     checkpoint_path = os.path.join(exps_root, args.exp, 'best_checkpoint.pth')
 
     model = load_model(checkpoint_path, device, config)
     
     embed_dim = config["training"].get("embed_dim_final", 128)
     memory_bank = MemoryBankV(memory_size=100, feature_dim=embed_dim).to(device)
-    memory_bank_path = os.path.join(exps_root, args.exp, "energy_memory_bank.pth")
-    memory_bank.load_memory_bank(memory_bank_path, device=device)
-    print("[INFO] Memory bank loaded successfully.")
+    memory_bank.load_memory_bank(os.path.join(exps_root, args.exp, "energy_memory_bank.pth"), device=device)
 
     data_dir = config["data"]["data_dir"]
-    split_json = config["data"]["split_json"]
-    datasets = os.path.join(data_dir, split_json)
+    datasets = os.path.join(data_dir, config["data"]["split_json"])
     _, _, test_transforms = load_transforms(config, device)
-    test_files = load_decathlon_datalist(datasets, True, "validation")
-    test_files = test_files[:5] # Demo limit
     
-    print("[INFO] Initializing standard Dataset (skipping PersistentDataset cache)...")
+    test_files = load_decathlon_datalist(datasets, True, "validation")[:5] 
     test_ds = Dataset(data=test_files, transform=test_transforms)
     test_loader = ThreadDataLoader(test_ds, batch_size=1, num_workers=0)
 
-    print("[INFO] Running inference...")
-    output_vis_dir = os.path.join(exps_root, args.exp, "vis_i_energy_maps")
-    
+    output_vis_dir = os.path.join(exps_root, args.exp, "vis_interactive")
     results = infer_and_segment(model, memory_bank, test_loader, device, output_vis_dir)
     
-    if not results:
-        print("[ERROR] No results were generated! Check data loader.")
-        return
+    if not results: return
 
-    # Save NIfTI results
     output_seg_dir = "output_segmentations"
     os.makedirs(output_seg_dir, exist_ok=True)
+    for i, seg in enumerate(results):
+        nib.save(nib.Nifti1Image(seg.astype(np.int16), affine=np.eye(4)), os.path.join(output_seg_dir, f"segmentation_{i}.nii.gz"))
 
-    for i, segmentation in enumerate(results):
-        seg_volume = segmentation.astype(np.int16)
-        seg_nifti = nib.Nifti1Image(seg_volume, affine=np.eye(4))
-        nib.save(seg_nifti, os.path.join(output_seg_dir, f"segmentation_{i}.nii.gz"))
-
-    print(f"[INFO] Results saved to {output_seg_dir}")
-    
 if __name__ == "__main__":
     main()

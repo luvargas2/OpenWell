@@ -73,6 +73,9 @@ class MemoryBankV(nn.Module):
             }
         print(f"[INFO] Loaded {len(self.prototypes)} classes into Memory Bank.")
 
+    # ==========================================
+    # CORE LEARNING (Phase 1: Training)
+    # ==========================================
     @torch.no_grad()
     def update_prototypes(self, embeddings: torch.Tensor, labels: torch.Tensor):
         """
@@ -120,16 +123,13 @@ class MemoryBankV(nn.Module):
                 
                 # --- LOGIC FIX 2: Soft Background ---
                 # Background (0) is a "garbage" class with high variance. 
-                # We clamp its kappa to be low (max 10) to create a 'Shallow Well'.
+                # We clamp its kappa to be low to create a 'Shallow Well'.
                 # This allows Unseen objects (which don't match organs) to 
                 # register as High Energy rather than falling into the Background well.
-
                 if cval == 0:
-                    # Deepen the Background well so it captures the "true" background makes the background "well" deeper and narrower.
-                    # effectively leaving the "Unseen" pixels stranded in high-energy space.
-                    batch_kappa = torch.clamp(batch_kappa, max=50.0) # WAS 10.0
+                    batch_kappa = torch.clamp(batch_kappa, max=10.0) 
                 else:
-                    batch_kappa = torch.clamp(batch_kappa, max=100.0)
+                    batch_kappa = torch.clamp(batch_kappa, max=30.0)
 
                 # 4. Update Memory (EMA)
                 if cval not in self.prototypes:
@@ -157,52 +157,78 @@ class MemoryBankV(nn.Module):
         if self.epoch_counter > 0 and self.epoch_counter % 10 == 0:
             self.save_tsne_plot()
 
-    def query_voxelwise_novelty(self, embedding_3d: torch.Tensor):
+    # ==========================================
+    # INTERACTIVE ENROLLMENT (Phase 2: Inference)
+    # ==========================================
+    @torch.no_grad()
+    def enroll_interactive_prototype(self, new_class_id: int, mu_new: torch.Tensor, kappa_new: torch.Tensor):
         """
-        Computes Free Energy for every voxel based on stored prototypes.
+        Instantly adds a new class to the memory bank based on user guidance (Section 3.5).
+        This allows the model to immediately recognize this class in subsequent scans 
+        without any gradient-based retraining.
+        """
+        # Ensure tensors are normalized and on the correct device
+        mu_new = F.normalize(mu_new.detach(), p=2, dim=0)
+        kappa_new = kappa_new.detach()
+        
+        # Add to the dictionary. We set count to 1 so it can be updated via EMA later if desired.
+        self.prototypes[new_class_id] = {
+            'mu': mu_new,
+            'kappa': kappa_new,
+            'count': 1
+        }
+        print(f"[INFO] Successfully enrolled New Class {new_class_id} into Memory Bank!")
+        print(f"       -> Concentration (Kappa): {kappa_new.item():.2f}")
+
+    # ==========================================
+    # INFERENCE & ENERGY CALCULATION
+    # ==========================================
+    def query_voxelwise_novelty(self, embedding_3d: torch.Tensor, tau: float = 1.0, include_background: bool = False):
+        """
+        Computes Free Energy for every voxel based on stored prototypes (Eq. 7).
         """
         if not self.prototypes:
-            # Fallback if memory is empty
             return torch.ones_like(embedding_3d[:,0]), torch.zeros_like(embedding_3d[:,0])
 
         B, F_dim, D, H, W = embedding_3d.shape
         
-        # 1. Prepare Prototypes [C, F] and [C, 1]
         classes = sorted(self.prototypes.keys())
+        
+        if not include_background:
+             classes = [c for c in classes if int(c) != 0]
+        
+        if not classes:
+            return torch.zeros_like(embedding_3d[:,0]), torch.zeros_like(embedding_3d[:,0])
+
         mus = torch.stack([self.prototypes[c]['mu'] for c in classes]).to(embedding_3d.device)
         kappas = torch.stack([self.prototypes[c]['kappa'] for c in classes]).to(embedding_3d.device).unsqueeze(1)
         
-        # 2. Flatten Image: [B, N, F]
         emb_flat = embedding_3d.view(B, F_dim, -1).permute(0, 2, 1)
         emb_flat = F.normalize(emb_flat, p=2, dim=2) 
 
-        # 3. Compute Logits
-        # Similarity: [B, N, F] @ [F, C] -> [B, N, C]
         cosine_sim = torch.matmul(emb_flat, mus.t())
         
-        # Scale by Concentration (Depth of Well)
-        # Broadcasting: [B, N, C] * [1, 1, C]
-        logits = cosine_sim * kappas.view(1, 1, -1)
+        # Scale by Concentration (Depth of Well) AND Temperature
+        logits = (cosine_sim * kappas.view(1, 1, -1)) / tau
         
-        # 4. Compute Free Energy E(z) = -LogSumExp(logits)
-        # High Energy = Low Probability = Anomaly
+        # Free Energy E(z) = -LogSumExp(logits)
         energy_flat = -torch.logsumexp(logits, dim=2) 
         
-        # 5. Prediction (Deepest Well)
         val, idx = torch.max(logits, dim=2)
         pred_flat = torch.tensor(classes, device=embedding_3d.device)[idx]
         
         return energy_flat.view(B, D, H, W), pred_flat.view(B, D, H, W)
 
+    # ==========================================
+    # VISUALIZATION
+    # ==========================================
     def save_tsne_plot(self, perplexity=30.0, random_state=42):
         if len(self.prototypes) < 2: return
 
-        # Extract data to CPU numpy
         class_ids = sorted(self.prototypes.keys())
         embeddings = torch.stack([self.prototypes[c]['mu'] for c in class_ids]).cpu().numpy()
         kappas = torch.stack([self.prototypes[c]['kappa'] for c in class_ids]).cpu().numpy()
         
-        # Visual size proportional to Concentration
         sizes = 100 + (kappas - kappas.min()) / (kappas.max() - kappas.min() + 1e-6) * 200
 
         try:
