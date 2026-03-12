@@ -80,7 +80,14 @@ def compute_vmf_loss(
     # 2. Prepare Prototypes (Mus & Kappas)
     mus = torch.stack([memory_bank.prototypes[c]["mu"] for c in classes]).to(embeddings.device)  # [C, F]
     kappas = torch.stack([memory_bank.prototypes[c]["kappa"] for c in classes]).to(embeddings.device)  # [C]
-    kappas = torch.clamp(kappas, min=1.0, max=30.0)
+    # Allow high kappas (up to 100) so deep organ wells are respected in the energy landscape.
+    kappas = torch.clamp(kappas, min=1.0, max=500.0)
+    # --- Fix 4: Normalise by mean kappa ---
+    # Without this, high-κ classes dominate the softmax and the gradient signal for
+    # low-κ classes (e.g. pancreas, gallbladder) vanishes. Dividing by κ̄ recovers
+    # a uniform-temperature contrastive loss when all classes are equally concentrated,
+    # and gracefully handles heterogeneous κ values.
+    kappa_mean = kappas.mean().clamp(min=1.0).detach()  # detach: temperature is not a learned param
     mus = F.normalize(mus, p=2, dim=1)
 
     # 3. Create Label -> Index Lookup Table
@@ -126,7 +133,7 @@ def compute_vmf_loss(
                 y = target_idx[keep]                 # [Na]
 
                 cos = z @ mus.t()                    # [Na, C]
-                logits = (cos * kappas.view(1, -1)) / tau
+                logits = (cos * kappas.view(1, -1)) / (tau * kappa_mean)
                 attr_loss = F.cross_entropy(logits, y)
                 has_attr = True
 
@@ -146,7 +153,7 @@ def compute_vmf_loss(
                 zu = zu[perm]
 
             cos_u = zu @ mus.t()                      # [Nu, C]
-            logits_u = (cos_u * kappas.view(1, -1)) / tau
+            logits_u = (cos_u * kappas.view(1, -1)) / (tau * kappa_mean)
 
             # Minimizing LogSumExp => Pushing away from all clusters
             rej_loss = torch.logsumexp(logits_u, dim=1).mean()

@@ -337,8 +337,9 @@ class MedOpenSeg(nn.Module):
         dec0 = self.decoder2(dec1, enc1)
         out = self.decoder1(dec0, enc0)
         logits = self.out(out)
-        #Added for MedOpenseg
-        embedding = self.embed_out(out)  
+        # Stop-gradient: vMF loss trains the projection head without corrupting the
+        # shared decoder features (and thus the segmentation head).
+        embedding = self.embed_out(out.detach())
         return logits, embedding
 
 
