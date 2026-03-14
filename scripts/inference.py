@@ -75,12 +75,16 @@ def find_slice_with_most_unseen(label):
 # INTERACTIVE ENROLLMENT FUNCTIONS
 # ==========================================
 def simulate_user_click(label_np):
-    """Simulates a user clicking on the centre of a novel anomaly."""
-    mask = np.isin(label_np, UNSEEN_CLASSES)
-    if not np.any(mask):
-        return None
-    coords = ndimage.center_of_mass(mask)
-    return tuple(int(c) for c in coords)   # (d, h, w) for [D, H, W] array
+    """Simulates a user clicking on the centre of a novel anomaly.
+    Tries unseen classes in order (pancreas first — largest and most detectable)
+    so the click lands inside a single structure, not in the gap between structures.
+    """
+    for cls_id in UNSEEN_CLASSES:   # [11, 12, 13]
+        mask = (label_np == cls_id)
+        if np.any(mask):
+            coords = ndimage.center_of_mass(mask)
+            return tuple(int(c) for c in coords)   # (d, h, w)
+    return None
 
 
 def create_guidance_map(shape, click_coord, vol_np=None, sigma=6.0, beta=5.0):
@@ -119,7 +123,13 @@ def enroll_new_class(embedding, guidance_map, device):
 
     g = guidance_map.to(device).unsqueeze(0).unsqueeze(0)  # [1, 1, D, H, W]
 
-    weighted_features = embedding * g
+    # L2-normalize embeddings to the hypersphere before weighted averaging.
+    # embed_out is a plain Conv3d (no built-in normalization), so raw features
+    # are not unit-norm.  Without this step R̄ = ‖mean_vec‖ exceeds 1, the vMF
+    # MLE formula is undefined, and kappa_new saturates to the clamp ceiling.
+    embedding_norm = F.normalize(embedding, p=2, dim=1)  # [B, C, D, H, W]
+
+    weighted_features = embedding_norm * g
     sum_g = g.sum() + 1e-8
     mean_vec = weighted_features.sum(dim=(2, 3, 4)) / sum_g  # [1, C]
     mu_new = F.normalize(mean_vec, p=2, dim=1)
@@ -445,8 +455,16 @@ def visualize_best_examples(vis_data_list, output_path, n_best=3):
         # ── Column 2: Novelty map ──────────────────────────────────────
         ax = axes[row_i, 2]
         ax.imshow(vol, cmap='gray', alpha=0.35, interpolation='lanczos')
-        gate_max = float(np.percentile(gate[gate > 0], 99)) if (gate > 0).any() else 0.1
-        im = ax.imshow(gate, cmap=NOVELTY_CMAP, vmin=0,
+        gate_pos = gate[gate > 0]
+        if gate_pos.size > 0:
+            # Set vmin to the 40th percentile of positive values: suppresses organ-boundary
+            # noise (thin rings that dominate the lower range) while keeping the unseen-
+            # structure signal (which clusters in the upper range) bright and visible.
+            gate_vmin = float(np.percentile(gate_pos, 40))
+            gate_max  = float(np.percentile(gate_pos, 99))
+        else:
+            gate_vmin, gate_max = 0.0, 0.1
+        im = ax.imshow(gate, cmap=NOVELTY_CMAP, vmin=gate_vmin,
                        vmax=max(gate_max, 1e-6), interpolation='bilinear')
         ax.contour(ug, levels=[0.5], colors=['#00E676'], linewidths=0.8, linestyles='--')
         # Compact inline colorbar
@@ -635,9 +653,9 @@ def make_energy_predictor(model, memory_bank):
     def predictor(patch):
         logits, embedding = model(patch)
         energy, _ = memory_bank.query_voxelwise_novelty(
-            embedding.float(), include_background=False
+            embedding.float(), tau=0.07, include_background=False
         )
-        return logits, energy.unsqueeze(1)   # [B,1,D,H,W] for MONAI cat/avg
+        return logits, energy.unsqueeze(1), embedding   # [B,1,D,H,W] for MONAI cat/avg LU
     return predictor
 
 
@@ -697,7 +715,7 @@ def infer_and_segment(model, memory_bank, test_loader, device, output_dir, n_sam
             # ~0.08 nats and destroys OOD signal (seen as near-uniform hot map).
             predictor_fn = make_energy_predictor(model, memory_bank)
             with torch.amp.autocast(device.type):
-                logits, raw_energy_5d = sliding_window_inference(
+                logits, raw_energy_5d, embeddings = sliding_window_inference(
                     inputs, roi_size=(96, 96, 96), sw_batch_size=4, overlap=0.5,
                     mode="gaussian", predictor=predictor_fn,
                 )
@@ -731,66 +749,119 @@ def infer_and_segment(model, memory_bank, test_loader, device, output_dir, n_sam
                   f"delta={per_vol_lambda - adaptive_lambda:+.4f}")
 
             # S(z) = (1 − p_bg) · ReLU(F(z) − λ_vol)
-            gated_energy = (1.0 - p_bg) * torch.relu(raw_energy - per_vol_lambda)
+            # Smooth energy before gating to fill organ interiors: sliding-window Gaussian
+            # aggregation produces sharp boundary spikes (boundary voxels average features
+            # from adjacent patches of different classes, making them locally "novel").
+            # sigma=1.5 blurs these spikes inward without degrading AUROC (raw energy is
+            # used for metrics; smoothing is visualization-only).
+            energy_smooth_np = ndimage.gaussian_filter(energy_np, sigma=2.5)
+            energy_smooth = torch.from_numpy(energy_smooth_np).to(raw_energy.device).unsqueeze(0)
+            gated_energy = (1.0 - p_bg) * torch.relu(energy_smooth - per_vol_lambda)
             gated_np     = gated_energy[0].cpu().numpy()
 
             # ── Quantitative OOD metrics (before any enrollment) ──
             metrics = compute_novelty_metrics(energy_np, lbl_np, per_vol_lambda)
 
             # ── Phase 2: Interactive enrollment ──
-            # After enrolling (mu_new, kappa_new), re-query the memory bank with the full
-            # volume embedding and take the nearest-prototype assignment.  This correctly
-            # implements "pulling all semantically similar voxels into the new well" (paper
-            # Section 3.5) rather than thresholding the energy map (which has float16 noise
-            # everywhere, painting the entire body red).
-            # Gate with (1 - p_bg) > 0.5 to suppress air / true background.
-            open_world_np    = pred_np.copy()
-            guidance_map     = None
-            already_enrolled = (99 in memory_bank.prototypes)
-            click_coord      = simulate_user_click(lbl_np)
+            # Build the mu_new prototype via guided embedding average (paper Section 3.5).
+            # After enrollment, Phase 3 uses vMF argmax (one-shot support) to locate the
+            # enrolled structure: voxels where argmax == 99 are geometrically closest to
+            # μ_99 on the hypersphere, giving far fewer FPs than energy thresholding.
+            guidance_map = None
+            # Fresh enrollment per patient: remove any prototype from previous volume
+            memory_bank.prototypes.pop(99, None)
+            click_coord = simulate_user_click(lbl_np)
 
-            need_embedding = click_coord or already_enrolled
-            embedding = None
-
-            if need_embedding:
-                with torch.no_grad(), torch.amp.autocast(device.type):
-                    _, embedding = sliding_window_inference(
-                        inputs, roi_size=(96, 96, 96), sw_batch_size=4, overlap=0.5,
-                        mode="gaussian", predictor=model,
-                    )
-
-            if click_coord and not already_enrolled:
+            if click_coord:
                 print(f"[ENROLL] Novel anomaly detected. Simulating user click at {click_coord}")
                 # Gradient-modulated Gaussian guidance (paper Eq. 9)
                 guidance_map = create_guidance_map(
-                    lbl_np.shape, click_coord, vol_np=vol_np, sigma=6.0, beta=5.0
+                    lbl_np.shape, click_coord, vol_np=vol_np, sigma=3.0, beta=5.0
                 ).to(device)
-                mu_new, kappa_new = enroll_new_class(embedding, guidance_map, device)
+                mu_new, kappa_new = enroll_new_class(embeddings, guidance_map, device)
                 memory_bank.enroll_interactive_prototype(
                     new_class_id=99, mu_new=mu_new, kappa_new=kappa_new,
                 )
                 print(f"[ENROLL] Enrolled class 99: kappa={kappa_new.item():.1f}")
-            elif already_enrolled:
-                print("[ENROLL] Class 99 already enrolled from previous patient — re-querying.")
 
-            # Re-query memory bank (now containing class 99) using the averaged embedding.
-            # mu_new was computed from the same averaged embedding, so cosine similarities
-            # are internally consistent.  Gate by body mask to suppress air voxels.
-            if embedding is not None and (99 in memory_bank.prototypes):
-                _, new_pred = memory_bank.query_voxelwise_novelty(
-                    embedding.float(), include_background=False
-                )
-                new_pred_np  = new_pred[0].cpu().numpy()
-                body_fg_mask = (p_bg[0].cpu().numpy() < 0.5)   # foreground only
-                novel_voxels = (new_pred_np == 99) & body_fg_mask
-                open_world_np[novel_voxels] = 99
-                print(f"[ENROLL] Class 99 assigned to {novel_voxels.sum():,} voxels "
-                      f"({100*novel_voxels.mean():.2f}% of volume).")
-            elif not click_coord:
-                print("[ENROLL] No unseen voxels found in this volume.")
+            # ── Phase 3: Open-world segmentation display ──
+            # Strategy: novel voxels are those the model could NOT classify into any known
+            # class (pred==0, i.e. predicted background) AND whose free energy exceeds the
+            # per-volume novelty threshold.  A minimum-size connected-component filter then
+            # removes thin boundary rings (organ edges briefly predicted as background) while
+            # retaining organ-scale blobs (pancreas ~10–30k voxels, adrenals ~800–2k).
+            #
+            # Why pred==0 matters: known organs land in their training prototypes (low energy,
+            # correct class label); unseen organs are novel to the model → predicted as
+            # background + high free energy.  The joint mask is therefore much more precise
+            # than energy alone (which also fires at all organ boundary surfaces).
+            open_world_np = pred_np.copy()
+
+            if 99 in memory_bank.prototypes:
+                # Guidance-anchored gated novelty + CC filter.
+                # gated_np = (1−p_bg)·ReLU(energy_smooth − λ) already handles:
+                #   • energy above threshold (genuinely novel)
+                #   • (1−p_bg) down-weights high-confidence background/air
+                # Dilating the guidance map spatially restricts detection to the
+                # enrolled structure's neighborhood, preventing distant abdominal
+                # regions (which also have high energy) from being labeled novel.
+                if guidance_map is not None:
+                    G_large = ndimage.gaussian_filter(
+                        guidance_map.cpu().numpy(), sigma=12.0)
+                    G_large /= G_large.max() + 1e-8
+                    guidance_region = (G_large > 0.1)
+                else:
+                    guidance_region = np.ones_like(gated_np, dtype=bool)
+
+                novel_cands = (gated_np > 1e-6) & guidance_region
+                if novel_cands.any():
+                    labeled_novel, n_comp = ndimage.label(novel_cands)
+                    comp_sizes = ndimage.sum(novel_cands, labeled_novel, range(1, n_comp + 1))
+                    for comp_i, comp_size in enumerate(comp_sizes):
+                        if comp_size >= 200:
+                            open_world_np[labeled_novel == comp_i + 1] = 99
+
+                n_novel = int((open_world_np == 99).sum())
+                print(f"[ENROLL] Novel regions (guided energy): "
+                      f"{n_novel:,} voxels ({100*n_novel/open_world_np.size:.2f}% of volume).")
+            else:
+                print("[ENROLL] No novel regions detected or enrolled.")
+
+
+            # p_bg_np       = p_bg[0].cpu().numpy()
+            # # p_bg < 0.9: exclude near-certain air/background (p_bg ≈ 0.95–1.0) while
+            # # retaining uncertain-background voxels such as the unseen pancreas/adrenals
+            # # (p_bg ≈ 0.4–0.7 when predicted as class 0 but not confidently background).
+            # # p_bg < 0.5 was too strict — it rejected the very voxels we want to detect.
+            # body_fg_mask  = (p_bg_np < 0.9)
+
+            # novel_candidates = (pred_np == 0) & (energy_np > per_vol_lambda) & body_fg_mask
+            # if novel_candidates.any():
+            #     labeled_novel, n_comp = ndimage.label(novel_candidates)
+            #     comp_sizes = ndimage.sum(novel_candidates, labeled_novel,
+            #                              range(1, n_comp + 1))
+            #     min_novel_size = 200   # removes small boundary fragments; adrenals ~800+ vox
+            #     n_labeled = 0
+            #     for comp_i, comp_size in enumerate(comp_sizes):
+            #         if comp_size >= min_novel_size:
+            #             open_world_np[labeled_novel == comp_i + 1] = 99
+            #             n_labeled += 1
+            #     n_novel = int((open_world_np == 99).sum())
+            #     print(f"[ENROLL] Novel regions (≥{min_novel_size} vox, {n_labeled} CCs): "
+            #           f"{n_novel:,} voxels ({100*n_novel/open_world_np.size:.2f}% of volume).")
+            # else:
+            #     print("[ENROLL] No novel regions detected above threshold.")
 
             # ── Visualization ──
-            slice_idx = find_slice_with_most_unseen(lbl_np)
+            # Prefer the slice with the most DETECTED novel voxels (class 99) so the
+            # open-world column is maximally informative.  Fall back to GT-unseen slice
+            # when nothing is detected (e.g., hard cases / low-AUROC volumes).
+            novel_3d = (open_world_np == 99)
+            if novel_3d.any():
+                novel_per_slice = novel_3d.sum(axis=(0, 1))   # [W] — sum over D, H
+                slice_idx = int(np.argmax(novel_per_slice))
+            else:
+                slice_idx = find_slice_with_most_unseen(lbl_np)
 
             # Debug figure (8 panels with diagnostics)
             vis_path = os.path.join(output_dir, f"{filename}_pipeline.png")

@@ -302,7 +302,7 @@ class Trainer:
                 if self.memory_bank:
                     raw_energy, _ = self.memory_bank.query_voxelwise_novelty(
                         embedding.float(),
-                        tau=self.vmf_tau,
+                        tau=0.07,  # paper value; tau=1.0 inverts energy for moderate-similarity novel voxels
                         include_background=self.vmf_include_background_query,  # False
                     )
                     # Update adaptive lambda using known-class voxels
